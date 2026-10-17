@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"os"
 
-	catzprint "github.com/Catalizo/catzprint-go/v2"
+	catzprint "github.com/Catalizo/catzprint-go-sdk/v2"
 )
 
 func main() {

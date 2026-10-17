@@ -10,7 +10,7 @@ receipts, PDFs, images and templates to printers from your Go services.
 ## Install
 
 ```sh
-go get github.com/Catalizo/catzprint-go/v2
+go get github.com/Catalizo/catzprint-go-sdk/v2
 ```
 
 ## Quickstart
@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"log"
 
-	catzprint "github.com/Catalizo/catzprint-go/v2"
+	catzprint "github.com/Catalizo/catzprint-go-sdk/v2"
 )
 
 func main() {

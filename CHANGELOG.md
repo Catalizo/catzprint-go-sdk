@@ -2,7 +2,7 @@
 
 ## 2.1.3 — 2026-10-17
 
-The module path is now `github.com/Catalizo/catzprint-go/v2` (Go requires the `/v2` suffix for versions 2 and later): `go get github.com/Catalizo/catzprint-go/v2` and update imports.
+The module path is now `github.com/Catalizo/catzprint-go-sdk/v2` (Go requires the `/v2` suffix for versions 2 and later): `go get github.com/Catalizo/catzprint-go-sdk/v2` and update imports.
 
 ### Security
 
