@@ -3,7 +3,7 @@
 The official Go client for the [CatzPrint](https://catzprint.com) API: send
 receipts, PDFs, images and templates to printers from your Go services.
 
-- Go 1.22+, standard library only (plus `golang.org/x/crypto` for sealed printing)
+- Go 1.26+, standard library only (plus `golang.org/x/crypto` for sealed printing)
 - `context.Context` on every call, functional options, typed errors for `errors.As`
 - Safe automatic retries with idempotency keys, auto-paging iterators, webhook verification
 
