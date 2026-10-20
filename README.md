@@ -70,6 +70,8 @@ fmt.Println(key.OrgID, key.OrgName, key.Live, key.Scopes)
 Choose a destination with `PrinterID`, `LocationID` and/or `Role` (or leave
 them empty to use your routing rules), and exactly one content source.
 
+Printer names aren't unique (two stations can each have a "Kitchen"), so target printers by ID. `client.Printers.List` returns each printer's `id`, `station_id`, `station_name`, `location_id` and `role`. Optional shortcut: in the CatzPrint console, open **Locations & stations** (**My devices** in a personal account), then a station, and click the ID under a printer's name to copy it.
+
 ```go
 // Plain text
 job, err := client.PrintText(ctx, "Table 4\n2 x Soup", catzprint.JobParams{Role: "kitchen"})
