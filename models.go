@@ -54,6 +54,28 @@ type Job struct {
 	PrintedAt    *time.Time `json:"printed_at"`
 	FinishedAt   *time.Time `json:"finished_at"`
 
+	// PrintedLocally is true when a station printed the job through its
+	// local API (directly, or reported later by reconciliation).
+	PrintedLocally bool `json:"printed_locally"`
+	// LocalDevice is the name of the device that sent a local job.
+	LocalDevice *string `json:"local_device"`
+	// DuplicateOf is set on a job recorded by reconciliation when another
+	// job with the same idempotency key had already printed elsewhere.
+	DuplicateOf *string `json:"duplicate_of"`
+	// Offline is true in webhook payloads when the station had no cloud
+	// connection when it printed.
+	Offline bool `json:"offline,omitempty"`
+	// IdempotencyKey is the job's idempotency key, when the API or station
+	// reports it.
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
+
+	// Via is set by the SDK: "local" when a station on the local network
+	// took the job, "cloud" when the CatzPrint API did. Jobs.Create and
+	// Jobs.Get fill it.
+	Via string `json:"via,omitempty"`
+	// Local is the station's own view of a local job (Via == "local").
+	Local *LocalJob `json:"-"`
+
 	// Events is the job's status history. Only Jobs.Get fills it.
 	Events []JobEvent `json:"events,omitempty"`
 }

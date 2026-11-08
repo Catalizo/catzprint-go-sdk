@@ -72,6 +72,12 @@ type ConflictError struct{ *APIError }
 // ServerError is a 5xx.
 type ServerError struct{ *APIError }
 
+// PrinterError is a 503 from a CatzPrint station whose printer can't print
+// right now. Code is printer_offline, out_of_paper, cover_open or
+// printer_error. The job was not accepted; fix the printer and send it again
+// (the SDK never falls back to the cloud for these).
+type PrinterError struct{ *APIError }
+
 func (e *AuthenticationError) Unwrap() error { return e.APIError }
 func (e *PermissionError) Unwrap() error     { return e.APIError }
 func (e *NotFoundError) Unwrap() error       { return e.APIError }
@@ -80,12 +86,15 @@ func (e *OutOfPrintsError) Unwrap() error    { return e.APIError }
 func (e *RateLimitError) Unwrap() error      { return e.APIError }
 func (e *ConflictError) Unwrap() error       { return e.APIError }
 func (e *ServerError) Unwrap() error         { return e.APIError }
+func (e *PrinterError) Unwrap() error        { return e.APIError }
 
 // typed wraps the error in its kind-specific type.
 func (e *APIError) typed() error {
 	switch {
 	case e.Status == http.StatusPaymentRequired || e.Code == "out_of_prints":
 		return &OutOfPrintsError{e}
+	case isPrinterCode(e.Code):
+		return &PrinterError{e}
 	case e.Status == http.StatusUnauthorized:
 		return &AuthenticationError{e}
 	case e.Status == http.StatusForbidden:
@@ -106,7 +115,12 @@ func (e *APIError) typed() error {
 
 // ConnectionError is a network failure or timeout before an API answer
 // arrived. It unwraps to the cause (e.g. context.DeadlineExceeded).
-type ConnectionError struct{ Err error }
+type ConnectionError struct {
+	Err error
+	// delivered: the request was fully written before the failure, so the
+	// server may have acted on it.
+	delivered bool
+}
 
 func (e *ConnectionError) Error() string { return "catzprint: connection failed: " + e.Err.Error() }
 func (e *ConnectionError) Unwrap() error { return e.Err }

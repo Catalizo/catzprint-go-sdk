@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -174,29 +175,102 @@ func detectKind(b []byte, name string) string {
 
 // Create sends a job to print. It always carries an idempotency key, so
 // network failures and 5xx/429 answers are retried safely.
+//
+// With WithLocal in a mode other than cloud, the job goes to a station on
+// the local network and/or the cloud as the mode says; Job.Via tells which
+// one took it. In local_first and cloud_first the same idempotency key
+// (generated as "sdk-<uuid>" when empty) is used for both, so a fallback
+// never prints twice.
 func (s *JobsService) Create(ctx context.Context, params JobParams) (*Job, error) {
-	if params.IdempotencyKey == "" {
-		params.IdempotencyKey = newUUID()
-	}
-	body, err := s.body(ctx, &params)
+	return s.create(ctx, params)
+}
+
+// cloudRequest is a job create ready to send: the same bytes (sealed
+// content included) go out on every attempt, so a retry or a re-send is
+// identical to the first request.
+type cloudRequest struct {
+	path string
+	body json.RawMessage
+	key  string
+}
+
+// prepareCloud builds (and seals) the request once. Failures here happen
+// before the job POST, so they are marked as not sent (except invalid
+// parameters, which are returned as is).
+func (s *JobsService) prepareCloud(ctx context.Context, p JobParams) (*cloudRequest, error) {
+	body, err := s.body(ctx, &p)
 	if err != nil {
-		return nil, err
+		var ve *ValidationError
+		if errors.As(err, &ve) {
+			return nil, err
+		}
+		return nil, &notSentError{err} // e.g. the server key fetch for sealing
 	}
 	path, err := s.c.orgPath(ctx, "/jobs")
 	if err != nil {
-		return nil, err
+		return nil, &notSentError{err} // e.g. the org-ID lookup
 	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("catzprint: encoding request: %w", err)
+	}
+	return &cloudRequest{path: path, body: raw, key: p.IdempotencyKey}, nil
+}
+
+// postCloud sends a prepared create.
+func (s *JobsService) postCloud(ctx context.Context, r *cloudRequest, o callOpts) (*Job, error) {
 	var out struct {
 		Job *Job `json:"job"`
 	}
-	if err := s.c.do(ctx, http.MethodPost, path, nil, body, &out, true); err != nil {
+	if err := s.c.doWith(ctx, o, http.MethodPost, r.path, nil, r.body, &out, true); err != nil {
 		return nil, err
 	}
+	if out.Job == nil || out.Job.ID == "" {
+		return nil, &APIError{Status: http.StatusCreated, Code: "invalid_response", Message: "The API answered without a job."}
+	}
+	out.Job.Via = ViaCloud
 	return out.Job, nil
 }
 
-// Get returns a job with its status history (Job.Events).
+// createCloudMode is the cloud-mode create (also used for jobs that can't
+// print locally in the fallback modes): retries per the client's policy,
+// then up to 3 identical re-sends after a 409 "duplicate"/"being created".
+func (s *JobsService) createCloudMode(ctx context.Context, params JobParams) (*Job, error) {
+	if params.IdempotencyKey == "" {
+		params.IdempotencyKey = newUUID() // fixed before the first send
+	}
+	r, err := s.prepareCloud(ctx, params)
+	if err != nil {
+		var ns *notSentError
+		if errors.As(err, &ns) {
+			return nil, ns.err
+		}
+		return nil, err
+	}
+	ambiguous := false
+	o := s.c.defaultCallOpts()
+	o.ambiguous = &ambiguous
+	unknown := func(e error) error {
+		return &OutcomeUnknownError{URL: s.c.baseURL, IdempotencyKey: r.key, Cause: e}
+	}
+	job, err := s.postCloud(ctx, r, o)
+	if params.Sealed && sealedRejected(err) && ctx.Err() == nil {
+		// The API couldn't decrypt the sealed content (key rotated): seal
+		// again with a fresh key, once (S1).
+		return s.resealAndResend(ctx, params, o, err, ambiguous, unknown)
+	}
+	if isConflictInProgress(err) && ctx.Err() == nil {
+		return s.resendWhileInProgress(ctx, r, o, err, unknown)
+	}
+	return job, err
+}
+
+// Get returns a job with its status history (Job.Events). Local job IDs
+// ("lj_…", from a job a station took) are read from the station.
 func (s *JobsService) Get(ctx context.Context, id string) (*Job, error) {
+	if strings.HasPrefix(id, "lj_") && s.c.local != nil {
+		return s.c.Local.GetJob(ctx, id)
+	}
 	path, err := s.c.orgPath(ctx, "/jobs/%s", id)
 	if err != nil {
 		return nil, err
@@ -212,6 +286,7 @@ func (s *JobsService) Get(ctx context.Context, id string) (*Job, error) {
 		return nil, &APIError{Status: http.StatusOK, Code: "invalid_response", Message: "The API answered without a job."}
 	}
 	out.Job.Events = out.Events
+	out.Job.Via = ViaCloud
 	return out.Job, nil
 }
 
@@ -437,7 +512,7 @@ func (s *JobsService) WaitFor(ctx context.Context, id string, opts ...WaitOption
 			var ce *ConnectionError
 			var se *ServerError
 			var rl *RateLimitError
-			if !errors.As(err, &ce) && !errors.As(err, &se) && !errors.As(err, &rl) {
+			if !errors.As(err, &ce) && !errors.As(err, &se) && !errors.As(err, &rl) && !IsStationUnreachable(err) {
 				return nil, err
 			}
 			// Transient: keep polling until the deadline.

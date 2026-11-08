@@ -19,16 +19,18 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // Version is the SDK version.
-const Version = "2.1.3"
+const Version = "2.2.1"
 
 // DefaultBaseURL is the production API.
 const DefaultBaseURL = "https://api-v1.catzprint.com"
@@ -53,9 +55,11 @@ type Client struct {
 	maxBackoff time.Duration
 	userAgent  string
 
-	mu        sync.Mutex
-	orgID     string
-	serverKey *[32]byte
+	mu           sync.Mutex
+	orgID        string
+	serverKey    *[32]byte
+	serverKeyAt  time.Time // when serverKey was fetched (refreshed after serverKeyTTL)
+	serverKeyGen uint64    // bumped by dropServerKey; a fetch installs its key only if unchanged
 
 	// Jobs creates, lists and manages print jobs.
 	Jobs *JobsService
@@ -67,6 +71,16 @@ type Client struct {
 	Templates *TemplatesService
 	// Webhooks verifies webhook signatures.
 	Webhooks *WebhooksService
+	// Local talks to CatzPrint stations on the local network (status,
+	// discovery, pairing, local jobs). See WithLocal.
+	Local *LocalService
+	// LocalTokens mints and revokes local tokens for stations.
+	LocalTokens *LocalTokensService
+	// LocalEndpoints lists the organization's stations' local addresses.
+	LocalEndpoints *LocalEndpointsService
+
+	localCfg *LocalConfig
+	local    *localState
 }
 
 // Option configures a Client.
@@ -135,9 +149,12 @@ func NewClient(opts ...Option) (*Client, error) {
 		o(c)
 	}
 	if c.apiKey == "" {
-		return nil, errors.New("catzprint: no API key; pass WithAPIKey or set CATZPRINT_API_KEY")
-	}
-	if !strings.HasPrefix(c.apiKey, "cz_live_") && !strings.HasPrefix(c.apiKey, "cz_test_") {
+		// A paired device (WithLocal, ModeLocal, a static Token) needs no
+		// cloud account; its cloud calls return errNoAPIKey.
+		if lc := c.localCfg; lc == nil || lc.Mode != ModeLocal || lc.Token == "" {
+			return nil, errors.New("catzprint: no API key; pass WithAPIKey or set CATZPRINT_API_KEY (only a paired device in local mode, WithLocal with Mode local and a Token, can work without one)")
+		}
+	} else if !strings.HasPrefix(c.apiKey, "cz_live_") && !strings.HasPrefix(c.apiKey, "cz_test_") {
 		return nil, errors.New("catzprint: API keys start with cz_live_ or cz_test_")
 	}
 	if err := checkBaseURL(c.baseURL); err != nil {
@@ -165,6 +182,14 @@ func NewClient(opts ...Option) (*Client, error) {
 	c.Locations = &LocationsService{c: c}
 	c.Templates = &TemplatesService{c: c}
 	c.Webhooks = &WebhooksService{}
+	c.LocalTokens = &LocalTokensService{c: c}
+	c.LocalEndpoints = &LocalEndpointsService{c: c}
+	c.Local = &LocalService{c: c}
+	l, err := newLocalState(c, c.localCfg)
+	if err != nil {
+		return nil, err
+	}
+	c.local = l
 	return c, nil
 }
 
@@ -264,9 +289,37 @@ func (c *Client) orgPath(ctx context.Context, format string, args ...any) (strin
 	return "/v1/orgs/" + url.PathEscape(org) + fmt.Sprintf(format, esc...), nil
 }
 
+// callOpts overrides the client's retry count and per-attempt timeout for
+// one call.
+type callOpts struct {
+	maxRetries int
+	timeout    time.Duration
+	// ambiguous, when set, is set to true when an attempt that may have
+	// reached the API (sent, then no usable answer) was retried.
+	ambiguous *bool
+}
+
+func (c *Client) defaultCallOpts() callOpts {
+	return callOpts{maxRetries: c.maxRetries, timeout: c.timeout}
+}
+
 // do sends one API call with retries. retryPOST says whether a POST is safe
 // to retry (it carries an idempotency key).
 func (c *Client) do(ctx context.Context, method, path string, query url.Values, body any, out any, retryPOST bool) error {
+	return c.doWith(ctx, c.defaultCallOpts(), method, path, query, body, out, retryPOST)
+}
+
+// errNoAPIKey is returned by cloud calls of a client built without an API
+// key (a paired device in local mode).
+func errNoAPIKey() error {
+	return &AuthenticationError{&APIError{Code: "missing_api_key",
+		Message: "This client has no API key (a paired device in local mode), so it can't call the CatzPrint API."}}
+}
+
+func (c *Client) doWith(ctx context.Context, o callOpts, method, path string, query url.Values, body any, out any, retryPOST bool) error {
+	if c.apiKey == "" {
+		return errNoAPIKey()
+	}
 	var payload []byte
 	if body != nil {
 		var err error
@@ -280,7 +333,7 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	}
 	retryable := method != http.MethodPost || retryPOST
 	for attempt := 0; ; attempt++ {
-		respBody, status, header, err := c.attempt(ctx, method, u, payload)
+		respBody, status, header, err := c.attempt(ctx, o.timeout, method, u, payload)
 		if err == nil && status < 300 {
 			if out == nil || len(bytes.TrimSpace(respBody)) == 0 {
 				return nil
@@ -294,10 +347,14 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 			err = parseError(status, header, respBody)
 		}
 		if ctx.Err() != nil {
-			return &ConnectionError{Err: ctx.Err()}
+			var ce *ConnectionError
+			return &ConnectionError{Err: ctx.Err(), delivered: errors.As(err, &ce) && ce.delivered}
 		}
-		if !retryable || attempt >= c.maxRetries || !shouldRetry(err) {
+		if !retryable || attempt >= o.maxRetries || !shouldRetry(err) {
 			return err
+		}
+		if o.ambiguous != nil && sentAndLost(err) {
+			*o.ambiguous = true
 		}
 		if werr := sleepCtx(ctx, c.retryDelay(attempt, err)); werr != nil {
 			return &ConnectionError{Err: werr}
@@ -305,16 +362,24 @@ func (c *Client) do(ctx context.Context, method, path string, query url.Values, 
 	}
 }
 
-func (c *Client) attempt(ctx context.Context, method, u string, payload []byte) ([]byte, int, http.Header, error) {
-	if c.timeout > 0 {
+func (c *Client) attempt(ctx context.Context, timeout time.Duration, method, u string, payload []byte) ([]byte, int, http.Header, error) {
+	if timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, c.timeout)
+		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
 	var rd io.Reader
 	if payload != nil {
 		rd = bytes.NewReader(payload)
 	}
+	var wrote atomic.Bool
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		WroteRequest: func(i httptrace.WroteRequestInfo) {
+			if i.Err == nil {
+				wrote.Store(true)
+			}
+		},
+	})
 	req, err := http.NewRequestWithContext(ctx, method, u, rd)
 	if err != nil {
 		return nil, 0, nil, fmt.Errorf("catzprint: building request: %w", err)
@@ -327,12 +392,12 @@ func (c *Client) attempt(ctx context.Context, method, u string, payload []byte) 
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, 0, nil, &ConnectionError{Err: err}
+		return nil, 0, nil, &ConnectionError{Err: err, delivered: wrote.Load()}
 	}
 	defer resp.Body.Close()
 	b, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		return nil, 0, nil, &ConnectionError{Err: err}
+		return nil, 0, nil, &ConnectionError{Err: err, delivered: true}
 	}
 	if len(b) > maxResponseBytes {
 		return nil, 0, nil, &APIError{Status: resp.StatusCode, Code: "response_too_large",
@@ -390,6 +455,7 @@ func parseError(status int, header http.Header, body []byte) error {
 			Code              string            `json:"code"`
 			Message           string            `json:"message"`
 			Fields            map[string]string `json:"fields"`
+			Param             string            `json:"param"`
 			RetryAfterSeconds int               `json:"retry_after_seconds"`
 		} `json:"error"`
 	}
@@ -399,6 +465,16 @@ func parseError(status int, header http.Header, body []byte) error {
 		Code:    env.Error.Code,
 		Message: env.Error.Message,
 		Fields:  env.Error.Fields,
+	}
+	if len(e.Fields) == 0 && env.Error.Param != "" && env.Error.Message != "" {
+		e.Fields = map[string]string{env.Error.Param: env.Error.Message}
+	}
+	if status >= 300 && status < 400 {
+		// The API never redirects: a 3xx is a proxy or a wrong base URL.
+		e.Code = "unexpected_redirect"
+		if e.Message == "" {
+			e.Message = "The API answered with an unexpected redirect."
+		}
 	}
 	if e.Code == "" {
 		e.Code = "http_" + strconv.Itoa(status)

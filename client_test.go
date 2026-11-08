@@ -207,7 +207,7 @@ func TestCreateReusesIdempotencyKeyAcrossRetries(t *testing.T) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/orgs/org1/jobs" {
 			t.Errorf("unexpected %s %s", r.Method, r.URL.Path)
 		}
-		if r.Header.Get("Authorization") != "Bearer "+fakeKey || !strings.HasPrefix(r.Header.Get("User-Agent"), "catzprint-go/2.1.3") {
+		if r.Header.Get("Authorization") != "Bearer "+fakeKey || !strings.HasPrefix(r.Header.Get("User-Agent"), "catzprint-go/"+Version) {
 			t.Errorf("bad headers %v", r.Header)
 		}
 		var body map[string]any
